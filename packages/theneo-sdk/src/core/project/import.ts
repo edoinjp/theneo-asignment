@@ -104,6 +104,7 @@ export function importProject(
   importInput.importOption = options.importOption;
   importInput.importMetadata = options.importMetadata;
   importInput.tabSlug = options.tabSlug;
+  importInput.descriptionGenerationType = options.descriptionGenerationType;
 
   if (usesMergeWithAdditionalData(options.importOption)) {
     importInput.importOptionAdditionalData = withDefaultMergeStrategies(

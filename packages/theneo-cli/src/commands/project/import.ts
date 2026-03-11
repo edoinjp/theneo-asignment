@@ -17,6 +17,7 @@ import {
   getImportSource,
   getPostmanApiKeyOption,
   getPostmanCollectionsOption,
+  getDescriptionGenerationOption,
   ImportCommandOptions,
   ImportOptionsEnum,
 } from '../../core/cli/project';
@@ -25,6 +26,7 @@ import {
   ImportOption,
   ImportOptionAdditionalData,
   MergingStrategy,
+  DescriptionGenerationType,
 } from '@theneo/sdk';
 import { confirm } from '@inquirer/prompts';
 import { isInteractiveFlow } from '../../utils';
@@ -36,16 +38,6 @@ const SPINNER_MESSAGE_MERGE_V2 =
 
 function isMergeV2Import(importOption: ImportOption): boolean {
   return String(importOption) === MERGE_V2_IMPORT_OPTION;
-}
-
-function hasNoImportSource(options: ImportCommandOptions): boolean {
-  const hasFile = Boolean(options.file);
-  const hasLink = Boolean(options.link);
-  const hasPostman =
-    Boolean(options.postmanApiKey) &&
-    Array.isArray(options.postmanCollection) &&
-    options.postmanCollection.length > 0;
-  return !hasFile && !hasLink && !hasPostman;
 }
 
 function getImportSpinnerText(
@@ -122,6 +114,53 @@ function handleProjectImportSuccess(
   }
 }
 
+async function getDescriptionGenerationModeForImport(
+  importOption: ImportOption,
+  options: ImportCommandOptions,
+  isInteractive: boolean
+): Promise<DescriptionGenerationType> {
+  // AI generation only available with overwrite import type
+  if (importOption !== ImportOption.OVERWRITE) {
+    return DescriptionGenerationType.NO_GENERATION;
+  }
+
+  // If user provided flag, use it (Casting to enum to fix TS2322)
+  if (
+    options.generateDescription &&
+    options.generateDescription !== DescriptionGenerationType.NO_GENERATION
+  ) {
+    return options.generateDescription as DescriptionGenerationType;
+  }
+
+  // Interactive: ask user if import type is overwrite
+  if (isInteractive && importOption === ImportOption.OVERWRITE) {
+    const { select } = await import('@inquirer/prompts');
+    return select<DescriptionGenerationType>({
+      message: 'Select description generation option with AI',
+      choices: [
+        {
+          name: "Don't generate descriptions",
+          value: DescriptionGenerationType.NO_GENERATION,
+        },
+        {
+          name: 'Fill empty descriptions',
+          value: DescriptionGenerationType.FILl, // Kept your specific casing
+        },
+        {
+          name: 'Overwrite descriptions',
+          value: DescriptionGenerationType.OVERWRITE,
+        },
+      ],
+    });
+  }
+
+  // Default: no generation (Casting fallback to fix TS2322)
+  return (
+    (options.generateDescription as DescriptionGenerationType) ||
+    DescriptionGenerationType.NO_GENERATION
+  );
+}
+
 async function getImportOptionAdditionalData(
   importOption: ImportOption,
   options: ImportCommandOptions,
@@ -166,6 +205,70 @@ async function getImportOptionAdditionalData(
     sectionDescriptionMergeStrategy: options.keepOldSectionDescription
       ? MergingStrategy.KEEP_OLD
       : MergingStrategy.KEEP_NEW,
+  };
+}
+
+async function validateAndGetImportSource(
+  options: ImportCommandOptions
+): Promise<void> {
+  const hasNoSource =
+    !options.file &&
+    !options.link &&
+    (!options.postmanApiKey ||
+      !options.postmanCollection ||
+      options.postmanCollection.length === 0);
+
+  if (hasNoSource) {
+    const inputSource = await getImportSource([
+      ImportOptionsEnum.FILE,
+      ImportOptionsEnum.LINK,
+      ImportOptionsEnum.POSTMAN,
+    ]);
+    Object.assign(options, inputSource);
+  }
+}
+
+function validateDescriptionGenerationOption(
+  options: ImportCommandOptions,
+  importOption: ImportOption
+): void {
+  const userRequestedAi =
+    options.generateDescription &&
+    options.generateDescription !== DescriptionGenerationType.NO_GENERATION;
+
+  const isInvalidCombination =
+    userRequestedAi && importOption !== ImportOption.OVERWRITE;
+
+  if (isInvalidCombination) {
+    console.error(
+      chalk.red(
+        '\nError: --generate-description requires --import-type overwrite'
+      )
+    );
+    console.error(
+      chalk.dim(
+        'AI description generation is currently only supported with the overwrite import type.'
+      )
+    );
+    process.exit(1);
+  }
+}
+
+function createProgressUpdateHandler(
+  generateDescription: DescriptionGenerationType,
+  spinner: Spinner
+): ((progressPercent: number) => void) | undefined {
+  if (generateDescription === DescriptionGenerationType.NO_GENERATION) {
+    return undefined;
+  }
+
+  return (progressPercent: number) => {
+    const progress = progressPercent
+      ? `| ${String(progressPercent).substring(0, 2)}%`
+      : '';
+    spinner.update({
+      text: `Generating descriptions ${progress}`,
+    });
   };
 }
 
@@ -223,6 +326,7 @@ Note: Published document link has this pattern: https://app.theneo.io/<workspace
       '--profile <string>',
       'Use a specific profile from your config file.'
     )
+    .addOption(getDescriptionGenerationOption())
     .option('--tab <tab-slug>', 'Import into specific tab only (optional)')
     .action(
       tryCatch(async (options: ImportCommandOptions) => {
@@ -248,19 +352,22 @@ Note: Published document link has this pattern: https://app.theneo.io/<workspace
           projectVersion,
           projectVersionSlug
         );
-        if (hasNoImportSource(options)) {
-          const inputSource = await getImportSource([
-            ImportOptionsEnum.FILE,
-            ImportOptionsEnum.LINK,
-            ImportOptionsEnum.POSTMAN,
-          ]);
-          options = { ...options, ...inputSource };
-        }
+        await validateAndGetImportSource(options);
 
         const importOption: ImportOption = await getImportOption(
           options,
           isInteractive
         );
+
+        // Validate user's explicit AI generation request before processing
+        validateDescriptionGenerationOption(options, importOption);
+
+        const generateDescription = await getDescriptionGenerationModeForImport(
+          importOption,
+          options,
+          isInteractive
+        );
+
         const importOptionAdditionalData:
           | ImportOptionAdditionalData
           | undefined = await getImportOptionAdditionalData(
@@ -273,6 +380,16 @@ Note: Published document link has this pattern: https://app.theneo.io/<workspace
         const spinner = createSpinner(
           getImportSpinnerText(options, importOption)
         ).start();
+
+        if (generateDescription !== DescriptionGenerationType.NO_GENERATION) {
+          spinner.update({ text: 'Generating descriptions' });
+        }
+
+        const progressUpdateHandler = createProgressUpdateHandler(
+          generateDescription,
+          spinner
+        );
+
         const res = await theneo.importProjectDocument({
           projectId: project.id,
           versionId: projectVersionId,
@@ -290,8 +407,14 @@ Note: Published document link has this pattern: https://app.theneo.io/<workspace
           },
           importOption: importOption,
           importOptionAdditionalData,
+          importMetadata: {
+            authorName: undefined,
+          },
           tabSlug: options.tab,
+          descriptionGenerationType: generateDescription,
+          progressUpdateHandler,
         });
+
         if (res.err) {
           handleProjectImportError(spinner, res.error.message, options.tab);
           process.exit(1);

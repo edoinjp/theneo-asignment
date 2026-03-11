@@ -37,6 +37,7 @@ export interface ImportCommandOptions {
   keepOldSectionDescription: boolean | undefined;
   tab: string | undefined;
   descriptionMergeStrategy: DescriptionMergeStrategy | undefined;
+  generateDescription: DescriptionGenerationType | undefined;
 }
 
 export const DESCRIPTION_MERGE_STRATEGIES = ['keep_new', 'keep_old'] as const;
